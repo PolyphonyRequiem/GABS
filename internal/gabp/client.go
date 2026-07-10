@@ -29,7 +29,15 @@ type Client struct {
 	eventHandlers map[string][]EventHandler
 	sequences     map[string]int
 	connected     bool
+	// requestTimeout is the per-request wait before giving up. Seeded from the
+	// server's advertised Limits.RequestTimeout at welcome time (falling back to
+	// defaultRequestTimeout). Configurable so long-running main-thread scripts
+	// (asset bundle loads, world streaming) are not cut off at a fixed 30s.
+	requestTimeout time.Duration
 }
+
+// defaultRequestTimeout is used when the GABP server advertises no RequestTimeout.
+const defaultRequestTimeout = 30 * time.Second
 
 // EventHandler is a function that handles events
 type EventHandler func(channel string, seq int, payload interface{})
@@ -193,7 +201,16 @@ func (c *Client) handshake() error {
 	c.agentId = welcome.AgentId
 	c.capabilities = welcome.Capabilities
 
-	c.log.Infow("GABP handshake complete", "agentId", c.agentId, "methods", len(c.capabilities.Methods))
+	// Seed the per-request timeout from the server's advertised limit (seconds).
+	// Falls back to defaultRequestTimeout when unset/zero. This is what lets a
+	// mod that knows some tools run long (asset-bundle loads, world streaming)
+	// widen the budget instead of every heavy call dying at a fixed 30s.
+	c.requestTimeout = defaultRequestTimeout
+	if welcome.Capabilities.Limits != nil && welcome.Capabilities.Limits.RequestTimeout > 0 {
+		c.requestTimeout = time.Duration(welcome.Capabilities.Limits.RequestTimeout) * time.Second
+	}
+
+	c.log.Infow("GABP handshake complete", "agentId", c.agentId, "methods", len(c.capabilities.Methods), "requestTimeout", c.requestTimeout)
 	return nil
 }
 
@@ -280,15 +297,33 @@ func (c *Client) sendRequest(method string, params interface{}) (interface{}, er
 		return nil, fmt.Errorf("failed to write request: %w", err)
 	}
 
+	// Determine the wait budget: prefer the negotiated per-client timeout,
+	// fall back to the package default.
+	timeout := c.requestTimeout
+	if timeout <= 0 {
+		timeout = defaultRequestTimeout
+	}
+	start := time.Now()
+
 	// Wait for response
 	select {
 	case resp := <-respCh:
 		if resp.Error != nil {
-			return nil, fmt.Errorf("GABP error %d: %s", resp.Error.Code, resp.Error.Message)
+			// Surface the FULL structured error from the game side (code + message)
+			// plus which method it came from — never a contentless failure.
+			return nil, fmt.Errorf("GABP error on %s (id=%s): code %d: %s",
+				method, req.ID, resp.Error.Code, resp.Error.Message)
 		}
 		return resp.Result, nil
-	case <-time.After(30 * time.Second):
-		return nil, fmt.Errorf("request timeout")
+	case <-time.After(timeout):
+		// Informative timeout: name the method, the request id, and how long we
+		// actually waited, so a stuck main thread vs. a slow script vs. a wedged
+		// bridge can be told apart. (This replaced an opaque "request timeout"
+		// that hid real compile/runtime errors behind a generic deadline.)
+		return nil, fmt.Errorf(
+			"request timeout: no response to %s (id=%s) after %s "+
+				"(game main thread may be blocked, or the script/tool is still running longer than the negotiated %s budget)",
+			method, req.ID, time.Since(start).Round(time.Millisecond), timeout)
 	}
 }
 

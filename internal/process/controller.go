@@ -172,7 +172,22 @@ func (c *Controller) IsRunning() bool {
 		return false
 	}
 
-	// For direct processes, check the managed process
+	// For DIRECT processes launched via a wrapper script (DirectPath), the tracked
+	// c.cmd is the WRAPPER, which typically exits right after spawning the real game
+	// binary — or the game is a grandchild we never reaped. Signalling the wrapper PID
+	// then wrongly reports "running" forever (the 14-hour-zombie bug: user closes the
+	// game manually, GABS never notices). When a StopProcessName is configured, trust
+	// the REAL process by name over the stale wrapper handle. This makes status honest
+	// and lets stale sessions get cleaned up instead of seizing the launcher.
+	if c.spec.StopProcessName != "" {
+		pids, err := findProcessesByName(c.spec.StopProcessName)
+		if err == nil {
+			return len(pids) > 0
+		}
+		// fall through to the cmd-based check if the name lookup itself failed
+	}
+
+	// For direct processes with no name to key on, check the managed process handle.
 	if c.cmd == nil || c.cmd.Process == nil {
 		return false
 	}

@@ -64,6 +64,41 @@ func (s *Server) ServeHTTP(ctx context.Context, addr string) error {
 		}
 	}()
 
+	// Background liveness reaper: GABS's checkGameStatus() already self-heals — for a
+	// direct process it calls IsRunning() (signal-0 probe) and, when the process is gone,
+	// runs cleanupStoppedGame() which tears down the stale GABP connection and marks the
+	// game stopped. But nothing DROVE that check unless a client happened to call
+	// games.status. So when the human closed the client, GABS kept reporting "running" and
+	// held a dead GABP socket until the next manual status call — wedging the next
+	// games.connect with a closed connection (Daniel hit this 2026-07-06). This ticker
+	// drives the existing self-heal on a timer so a closed client is reaped within seconds,
+	// no user action required.
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// Snapshot tracked game IDs under a brief read-lock, then release BEFORE
+				// calling checkGameStatus (which takes s.mu itself — holding across would deadlock).
+				s.mu.RLock()
+				ids := make([]string, 0, len(s.games))
+				for id := range s.games {
+					ids = append(ids, id)
+				}
+				s.mu.RUnlock()
+				for _, id := range ids {
+					// checkGameStatus reaps + cleans up any game whose process has exited.
+					if status := s.checkGameStatus(id); status == "stopped" {
+						s.log.Infow("reaped exited game (client closed); GABP connection cleaned up", "gameId", id)
+					}
+				}
+			}
+		}
+	}()
+
 	// Wait for context cancellation or server error
 	select {
 	case <-ctx.Done():
