@@ -27,12 +27,115 @@ type BridgeInfo struct {
 	Token string
 }
 
+// processInfo describes a single discovered process. UID and PGID are used to
+// scope discovery to the owning service user and the tracked process group so
+// GABS never signals an unrelated same-name process. A UID or PGID of -1 means
+// "unknown" (e.g. the platform could not resolve it) and disables that filter.
+type processInfo struct {
+	PID  int
+	UID  int
+	PGID int
+}
+
+// processFinder discovers processes by executable name. It is the single seam
+// through which the controller learns about the system, so tests can inject a
+// deterministic set of processes (e.g. two same-name clients owned by different
+// users or in different process groups) without spawning anything real.
+type processFinder interface {
+	FindByName(name string) ([]processInfo, error)
+}
+
 // Controller implements a stateless approach to process management
 // It queries the actual system state rather than maintaining internal state
 type Controller struct {
 	spec       LaunchSpec
 	cmd        *exec.Cmd
 	bridgeInfo *BridgeInfo
+
+	// finder is the process-discovery seam. When nil the OS-backed finder is
+	// used; tests override it to supply a deterministic process table.
+	finder processFinder
+
+	// serviceUID is the effective UID of this GABS process. Discovery is scoped
+	// to processes owned by this user so a GABS running as e.g. `valbot` can
+	// never signal a process owned by the primary user. Resolved lazily.
+	serviceUID int
+
+	// trackedPGID is the process group of the child GABS launched (Setpgid on
+	// Unix). When >0 and the group still has live members, discovery is further
+	// restricted to that group, which distinguishes this lane's game from an
+	// unrelated same-name client owned by the SAME service user. When the group
+	// has vanished (the common direct-wrapper case where the real game detaches
+	// from the wrapper's group) discovery falls back to UID scoping so tracking
+	// loss never widens the blast radius past the service user.
+	trackedPGID int
+}
+
+// getFinder returns the configured finder or the default OS-backed one.
+func (c *Controller) getFinder() processFinder {
+	if c.finder != nil {
+		return c.finder
+	}
+	return osProcessFinder{}
+}
+
+// ownUID returns the effective UID of this GABS process (cached). Returns -1 on
+// platforms where it cannot be resolved, which disables UID scoping.
+func (c *Controller) ownUID() int {
+	if c.serviceUID == 0 {
+		c.serviceUID = geteuidOrUnknown()
+	}
+	return c.serviceUID
+}
+
+// findScopedProcesses discovers processes named `name` and returns only those
+// PIDs that belong to this lane: owned by the GABS service user and, when a
+// live tracked process group is known, in that group. This is the single choke
+// point every stop/status path routes through so no code path can fall back to
+// a host-global match.
+func (c *Controller) findScopedProcesses(name string) ([]int, error) {
+	procs, err := c.getFinder().FindByName(name)
+	if err != nil {
+		return nil, err
+	}
+	return scopeProcesses(procs, c.ownUID(), c.trackedPGID), nil
+}
+
+// scopeProcesses applies the ownership + process-group scoping policy.
+//
+//   - UID filter: keep only processes whose UID matches uid. Skipped when uid or
+//     a process's UID is -1 (unknown), so platforms that cannot resolve owners
+//     degrade to name-only rather than crashing.
+//   - PGID filter: when pgid > 0 AND at least one UID-scoped process is in that
+//     group, restrict to that group. If the tracked group has no live members
+//     (tracking lost / game detached), fall back to the UID-scoped set instead
+//     of returning nothing, preserving direct-wrapper stop behavior.
+func scopeProcesses(procs []processInfo, uid, pgid int) []int {
+	var uidScoped []processInfo
+	for _, p := range procs {
+		if uid >= 0 && p.UID >= 0 && p.UID != uid {
+			continue
+		}
+		uidScoped = append(uidScoped, p)
+	}
+
+	if pgid > 0 {
+		var inGroup []int
+		for _, p := range uidScoped {
+			if p.PGID == pgid {
+				inGroup = append(inGroup, p.PID)
+			}
+		}
+		if len(inGroup) > 0 {
+			return inGroup
+		}
+	}
+
+	pids := make([]int, 0, len(uidScoped))
+	for _, p := range uidScoped {
+		pids = append(pids, p.PID)
+	}
+	return pids
 }
 
 // Configure sets up the controller with the given launch specification
@@ -119,6 +222,11 @@ func (c *Controller) Start() error {
 		c.cmd.Dir = c.spec.WorkingDir
 	}
 
+	// Put the child in its own process group so status/stop can scope to the
+	// tracked group (this lane's game) rather than any same-name process the
+	// service user happens to be running. No-op on platforms without pgroups.
+	configureProcessGroup(c.cmd)
+
 	// Set up environment variables
 	c.setupEnvironment()
 
@@ -129,6 +237,12 @@ func (c *Controller) Start() error {
 			Context: fmt.Sprintf("failed to start %s (mode: %s, target: %s)", c.spec.GameId, c.spec.Mode, c.spec.PathOrId),
 			Err:     err,
 		}
+	}
+
+	// Record the tracked process group (equals the child PID when it leads its
+	// own group). Discovery narrows to this group while it has live members.
+	if c.cmd.Process != nil {
+		c.trackedPGID = trackedGroupID(c.cmd.Process.Pid)
 	}
 
 	return nil
@@ -162,7 +276,7 @@ func (c *Controller) IsRunning() bool {
 	// For Steam/Epic launchers, check for the actual game process by name if configured
 	if c.spec.Mode == "SteamAppId" || c.spec.Mode == "EpicAppId" {
 		if c.spec.StopProcessName != "" {
-			pids, err := findProcessesByName(c.spec.StopProcessName)
+			pids, err := c.findScopedProcesses(c.spec.StopProcessName)
 			if err != nil {
 				return false
 			}
@@ -180,7 +294,7 @@ func (c *Controller) IsRunning() bool {
 	// the REAL process by name over the stale wrapper handle. This makes status honest
 	// and lets stale sessions get cleaned up instead of seizing the launcher.
 	if c.spec.StopProcessName != "" {
-		pids, err := findProcessesByName(c.spec.StopProcessName)
+		pids, err := c.findScopedProcesses(c.spec.StopProcessName)
 		if err == nil {
 			return len(pids) > 0
 		}
@@ -390,7 +504,7 @@ func (c *Controller) getBridgePath() string {
 }
 
 func (c *Controller) stopByProcessName(processName string, force bool, grace time.Duration) error {
-	pids, err := findProcessesByName(processName)
+	pids, err := c.findScopedProcesses(processName)
 	if err != nil {
 		return fmt.Errorf("failed to find processes named '%s': %w", processName, err)
 	}
@@ -540,55 +654,4 @@ func terminateProcess(pid int, grace time.Duration) error {
 
 		return nil
 	}
-}
-
-// findProcessesByName finds all processes with the given name
-func findProcessesByName(name string) ([]int, error) {
-	var pids []int
-
-	switch runtime.GOOS {
-	case "windows":
-		// Use tasklist command on Windows
-		cmd := exec.Command("tasklist", "/FI", "IMAGENAME eq "+name, "/FO", "CSV", "/NH")
-		output, err := cmd.Output()
-		if err != nil {
-			return nil, err
-		}
-
-		lines := strings.Split(string(output), "\n")
-		for _, line := range lines {
-			if strings.Contains(line, name) {
-				// Parse CSV: "ProcessName","PID","SessionName","Session#","MemUsage"
-				parts := strings.Split(line, ",")
-				if len(parts) >= 2 {
-					pidStr := strings.Trim(parts[1], "\"")
-					if pid, err := strconv.Atoi(pidStr); err == nil {
-						pids = append(pids, pid)
-					}
-				}
-			}
-		}
-	default:
-		// Use pgrep command on Unix-like systems
-		cmd := exec.Command("pgrep", "-x", name)
-		output, err := cmd.Output()
-		if err != nil {
-			// pgrep returns exit code 1 if no processes found, which is not an error for us
-			if exitError, ok := err.(*exec.ExitError); ok && exitError.ExitCode() == 1 {
-				return pids, nil // Return empty slice, no error
-			}
-			return nil, err
-		}
-
-		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-		for _, line := range lines {
-			if line != "" {
-				if pid, err := strconv.Atoi(line); err == nil {
-					pids = append(pids, pid)
-				}
-			}
-		}
-	}
-
-	return pids, nil
 }
