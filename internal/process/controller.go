@@ -585,6 +585,39 @@ func getTerminationSignal() os.Signal {
 	}
 }
 
+// reap waits for a process GABS launched so the kernel can release its slot.
+//
+// On Unix, SIGKILL/SIGTERM only detaches a *child* into <defunct> (Z) state; the
+// slot is not freed until the parent reaps it with wait(2). Every process GABS
+// stops via killProcess/terminateProcess was launched by GABS and is therefore a
+// direct child, so Wait4 is the correct call. A non-child PID (or one already
+// reaped by a normal-exit cmd.Wait at controller.go:320/:385) yields ECHILD,
+// which is legitimate and must not be treated as failure. This is the single
+// choke point both kill and terminate paths funnel through, so the reap-on-every-
+// exit-path invariant can't drift out of sync between the two helpers.
+//
+// On non-Unix platforms there is no zombie concept in this model; reap is a
+// no-op. Windows termination goes through taskkill, which reaps for us.
+func reap(pid int) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	// Loop because Wait4 can return EINTR on a delivered signal. WNOHANG is not
+	// used: after Kill/SIGTERM the child is dead or dying, and a blocking wait
+	// is what actually clears the Z entry.
+	for {
+		var ws syscall.WaitStatus
+		_, err := syscall.Wait4(pid, &ws, 0, nil)
+		if err == syscall.EINTR {
+			continue
+		}
+		// ECHILD: not our child (or already reaped) — expected, not an error.
+		// Any other error: nothing actionable at a stop site, and the caller's
+		// Kill result already carries the meaningful failure.
+		return
+	}
+}
+
 // killProcess forcefully terminates a process by PID
 func killProcess(pid int) error {
 	switch runtime.GOOS {
@@ -597,7 +630,11 @@ func killProcess(pid int) error {
 		if err != nil {
 			return err
 		}
-		return process.Kill()
+		killErr := process.Kill()
+		// Reap unconditionally: even if Kill reported an error (e.g. the process
+		// already exited), a child may still be sitting in Z awaiting a wait().
+		reap(pid)
+		return killErr
 	}
 }
 
@@ -639,19 +676,41 @@ func terminateProcess(pid int, grace time.Duration) error {
 		if grace > 0 {
 			done := make(chan error, 1)
 			go func() {
-				_, err := process.Wait()
-				done <- err
+				// NOTE: do NOT use process.Wait() here. On Unix, os.FindProcess
+				// returns a bare handle with no exec.Cmd behind it, and Wait()
+				// on such a handle returns immediately with an error instead of
+				// blocking until the child exits — so the select below would
+				// always take the <-done branch, never honour the grace period,
+				// and never reap. Wait4 with a blocking wait is what actually
+				// waits for and reaps the child.
+				var ws syscall.WaitStatus
+				for {
+					_, err := syscall.Wait4(pid, &ws, 0, nil)
+					if err == syscall.EINTR {
+						continue
+					}
+					done <- err
+					return
+				}
 			}()
 
 			select {
 			case <-done:
+				// Child exited within grace and Wait4 above reaped it.
 				return nil
 			case <-time.After(grace):
-				// Grace period expired, force kill
-				return process.Kill()
+				// Grace period expired, force kill then reap. A bare Kill here
+				// leaves the child in Z; reap() is what actually frees the slot.
+				killErr := process.Kill()
+				reap(pid)
+				return killErr
 			}
 		}
 
+		// grace <= 0: SIGTERM sent, no wait above. The child will exit and sit
+		// in Z until reaped, so reap here too. This is the path that leaked when
+		// callers passed grace=0.
+		reap(pid)
 		return nil
 	}
 }
