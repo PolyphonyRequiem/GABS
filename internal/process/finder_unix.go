@@ -46,8 +46,17 @@ func trackedGroupID(pid int) int {
 type osProcessFinder struct{}
 
 func (osProcessFinder) FindByName(name string) ([]processInfo, error) {
-	// -A: all processes; -o: pid,ruid,pgid,comm with no header.
-	cmd := exec.Command("ps", "-A", "-o", "pid=,ruid=,pgid=,comm=")
+	// -A: all processes; -o: pid,ruid,pgid,state,comm with no header.
+	//
+	// `state` is REQUIRED, not cosmetic: `ps -A` lists zombies (<defunct>), and a
+	// zombie still carries its original comm. Without filtering state we count
+	// dead processes as live, IsRunning() returns true forever, and games.start
+	// becomes a silent no-op because GABS believes the game is already up. That
+	// is the same class as the 14-hour-zombie bug documented in controller.go —
+	// fixed there for the stale-wrapper-handle path, but the name lookup itself
+	// still counted zombies, so it recurred one layer over. Observed on Valheim:
+	// 9 <defunct> valheim.x86_64 parented to gabs, 0 live, every launch refused.
+	cmd := exec.Command("ps", "-A", "-o", "pid=,ruid=,pgid=,state=,comm=")
 	output, err := cmd.Output()
 	if err != nil {
 		// ps returns non-zero only on real failure; no-match still exits 0 with
@@ -65,11 +74,18 @@ func (osProcessFinder) FindByName(name string) ([]processInfo, error) {
 	var procs []processInfo
 	for _, line := range strings.Split(string(output), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) < 4 {
+		if len(fields) < 5 {
 			continue
 		}
-		// comm may contain spaces; everything after the first three fields is it.
-		comm := strings.Join(fields[3:], " ")
+		// State is a single letter, optionally followed by modifiers (Ss, Rl, Z+).
+		// Z means the process has exited and is awaiting reaping by its parent —
+		// it holds a PID but can never run again, so it is not "running" by any
+		// useful definition. Skip it so liveness reflects reality.
+		if strings.HasPrefix(fields[3], "Z") {
+			continue
+		}
+		// comm may contain spaces; everything after the first four fields is it.
+		comm := strings.Join(fields[4:], " ")
 		if comm != target && comm != name {
 			continue
 		}
